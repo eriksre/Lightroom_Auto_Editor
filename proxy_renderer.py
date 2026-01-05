@@ -28,7 +28,78 @@ SLIDER_DEFAULTS = {
     "Shadows2012": 0.0,    # -100..100
     "Whites2012": 0.0,     # -100..100
     "Blacks2012": 0.0,     # -100..100
+    "Texture": 0.0,        # -100..100
+    "Clarity2012": 0.0,    # -100..100
+    "Dehaze": 0.0,         # -100..100
+    "Vibrance": 0.0,       # -100..100
+    "Saturation": 0.0,     # -100..100
+    "IncrementalTemperature": 0.0, # delta Kelvin
+    "IncrementalTint": 0.0,        # -150..150
+    # HSL - Hue
+    "HueAdjustmentRed": 0.0,
+    "HueAdjustmentOrange": 0.0,
+    "HueAdjustmentYellow": 0.0,
+    "HueAdjustmentGreen": 0.0,
+    "HueAdjustmentAqua": 0.0,
+    "HueAdjustmentBlue": 0.0,
+    "HueAdjustmentPurple": 0.0,
+    "HueAdjustmentMagenta": 0.0,
+    # HSL - Saturation
+    "SaturationAdjustmentRed": 0.0,
+    "SaturationAdjustmentOrange": 0.0,
+    "SaturationAdjustmentYellow": 0.0,
+    "SaturationAdjustmentGreen": 0.0,
+    "SaturationAdjustmentAqua": 0.0,
+    "SaturationAdjustmentBlue": 0.0,
+    "SaturationAdjustmentPurple": 0.0,
+    "SaturationAdjustmentMagenta": 0.0,
+    # HSL - Luminance
+    "LuminanceAdjustmentRed": 0.0,
+    "LuminanceAdjustmentOrange": 0.0,
+    "LuminanceAdjustmentYellow": 0.0,
+    "LuminanceAdjustmentGreen": 0.0,
+    "LuminanceAdjustmentAqua": 0.0,
+    "LuminanceAdjustmentBlue": 0.0,
+    "LuminanceAdjustmentPurple": 0.0,
+    "LuminanceAdjustmentMagenta": 0.0,
+    # Color grading
+    "ColorGradeBlending": 50.0,
+    "ColorGradeGlobalHue": 0.0,
+    "ColorGradeGlobalSat": 0.0,
+    "ColorGradeGlobalLum": 0.0,
+    "ColorGradeShadowHue": 0.0,
+    "ColorGradeShadowSat": 0.0,
+    "ColorGradeShadowLum": 0.0,
+    "ColorGradeMidtoneHue": 0.0,
+    "ColorGradeMidtoneSat": 0.0,
+    "ColorGradeMidtoneLum": 0.0,
+    "ColorGradeHighlightHue": 0.0,
+    "ColorGradeHighlightSat": 0.0,
+    "ColorGradeHighlightLum": 0.0,
+    # Calibration
+    "ShadowTint": 0.0,
+    "RedHue": 0.0,
+    "RedSaturation": 0.0,
+    "GreenHue": 0.0,
+    "GreenSaturation": 0.0,
+    "BlueHue": 0.0,
+    "BlueSaturation": 0.0,
 }
+
+HSL_COLOR_CENTERS = {
+    "Red": 0.0,
+    "Orange": 30.0 / 360.0,
+    "Yellow": 60.0 / 360.0,
+    "Green": 120.0 / 360.0,
+    "Aqua": 180.0 / 360.0,
+    "Blue": 240.0 / 360.0,
+    "Purple": 270.0 / 360.0,
+    "Magenta": 300.0 / 360.0,
+}
+
+HSL_WEIGHT_WIDTH = 0.08
+HUE_ADJ_MAX_DEG = 30.0
+CALIBRATION_HUE_MAX_DEG = 25.0
 
 
 @dataclass
@@ -101,6 +172,433 @@ def _compute_luma(rgb_lin: ImageArray) -> ImageArray:
     )
 
 
+def _temp_to_rgb(temp_k: float) -> np.ndarray:
+    temp_k = float(np.clip(temp_k, 1000.0, 40000.0))
+    t = temp_k / 100.0
+    if t <= 66.0:
+        r = 255.0
+        g = 99.4708025861 * np.log(t) - 161.1195681661
+        if t <= 19.0:
+            b = 0.0
+        else:
+            b = 138.5177312231 * np.log(t - 10.0) - 305.0447927307
+    else:
+        r = 329.698727446 * ((t - 60.0) ** -0.1332047592)
+        g = 288.1221695283 * ((t - 60.0) ** -0.0755148492)
+        b = 255.0
+    rgb = np.array([r, g, b], dtype=np.float32)
+    return np.clip(rgb / 255.0, 0.0, 1.0)
+
+
+def _apply_white_balance(
+    rgb_lin: ImageArray,
+    temp_delta: float,
+    tint_delta: float,
+    base_temp: float = 6500.0,
+) -> ImageArray:
+    if abs(float(temp_delta)) < 1e-6 and abs(float(tint_delta)) < 1e-6:
+        return rgb_lin
+    base_temp = float(base_temp)
+    target_temp = base_temp + float(temp_delta)
+    target_temp = float(np.clip(target_temp, 2000.0, 12000.0))
+
+    neutral = _temp_to_rgb(base_temp)
+    target = _temp_to_rgb(target_temp)
+    wb = target / (neutral + 1e-6)
+
+    tint = float(tint_delta)
+    g_scale = 1.0 + tint / 200.0
+    rb_scale = 1.0 - tint / 400.0
+    wb = wb * np.array([rb_scale, g_scale, rb_scale], dtype=np.float32)
+
+    if _is_torch(rgb_lin):
+        wb = torch.tensor(wb, device=rgb_lin.device, dtype=rgb_lin.dtype)
+    return rgb_lin * wb
+
+
+def _box_blur_2d(x: ImageArray, radius: int) -> ImageArray:
+    if radius <= 0:
+        return x
+    if _is_torch(x):
+        h, w = x.shape[-2], x.shape[-1]
+        if min(h, w) <= 1:
+            return x
+        radius = int(min(radius, min(h, w) - 1))
+        import torch.nn.functional as F
+        x4 = x[None, None, ...]
+        x4 = F.pad(x4, (radius, radius, radius, radius), mode="reflect")
+        k = 2 * radius + 1
+        out = F.avg_pool2d(x4, kernel_size=k, stride=1)
+        return out[0, 0, ...]
+
+    h, w = x.shape[-2], x.shape[-1]
+    if min(h, w) <= 1:
+        return x
+    radius = int(min(radius, min(h, w) - 1))
+    pad = radius
+    x_pad = np.pad(x, ((pad, pad), (pad, pad)), mode="reflect")
+    k = 2 * radius + 1
+    integral = np.pad(x_pad, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    total = (
+        integral[k:, k:]
+        - integral[:-k, k:]
+        - integral[k:, :-k]
+        + integral[:-k, :-k]
+    )
+    out = total / float(k * k)
+    return out[pad:-pad, pad:-pad]
+
+
+def _apply_local_contrast(
+    rgb_lin: ImageArray,
+    amount: float,
+    radius: int,
+    mask: Optional[ImageArray] = None,
+) -> ImageArray:
+    if abs(float(amount)) < 1e-6:
+        return rgb_lin
+    luma = _compute_luma(rgb_lin)
+    blur = _box_blur_2d(luma, radius)
+    detail = luma - blur
+    if mask is not None:
+        detail = detail * mask
+    luma_adj = _clip(luma + detail * amount, 0.0, 1.0)
+    scale = luma_adj / (luma + 1e-6)
+    return _clip(rgb_lin * scale[..., None], 0.0, 1.0)
+
+
+def _rgb_to_hsl(rgb: ImageArray) -> tuple[ImageArray, ImageArray, ImageArray]:
+    eps = 1e-6
+    if _is_torch(rgb):
+        maxc, _ = torch.max(rgb, dim=-1)
+        minc, _ = torch.min(rgb, dim=-1)
+        delta = maxc - minc
+        l = (maxc + minc) / 2.0
+        s = delta / (1.0 - torch.abs(2.0 * l - 1.0) + eps)
+        s = torch.where(delta > eps, s, torch.zeros_like(s))
+
+        r = rgb[..., 0]
+        g = rgb[..., 1]
+        b = rgb[..., 2]
+        h = torch.zeros_like(l)
+        mask = delta > eps
+        h_r = torch.remainder((g - b) / (delta + eps), 6.0)
+        h_g = ((b - r) / (delta + eps)) + 2.0
+        h_b = ((r - g) / (delta + eps)) + 4.0
+        h = torch.where((maxc == r) & mask, h_r, h)
+        h = torch.where((maxc == g) & mask, h_g, h)
+        h = torch.where((maxc == b) & mask, h_b, h)
+        h = torch.remainder(h / 6.0, 1.0)
+        return h, s, l
+
+    maxc = np.max(rgb, axis=-1)
+    minc = np.min(rgb, axis=-1)
+    delta = maxc - minc
+    l = (maxc + minc) / 2.0
+    s = delta / (1.0 - np.abs(2.0 * l - 1.0) + eps)
+    s = np.where(delta > eps, s, 0.0)
+
+    r = rgb[..., 0]
+    g = rgb[..., 1]
+    b = rgb[..., 2]
+    h = np.zeros_like(l)
+    mask = delta > eps
+    h_r = np.mod((g - b) / (delta + eps), 6.0)
+    h_g = ((b - r) / (delta + eps)) + 2.0
+    h_b = ((r - g) / (delta + eps)) + 4.0
+    h = np.where((maxc == r) & mask, h_r, h)
+    h = np.where((maxc == g) & mask, h_g, h)
+    h = np.where((maxc == b) & mask, h_b, h)
+    h = np.mod(h / 6.0, 1.0)
+    return h, s, l
+
+
+def _hsl_to_rgb(h: ImageArray, s: ImageArray, l: ImageArray) -> ImageArray:
+    eps = 1e-6
+    if _is_torch(h):
+        def hue_to_rgb(p: ImageArray, q: ImageArray, t: ImageArray) -> ImageArray:
+            t = torch.remainder(t, 1.0)
+            return torch.where(
+                t < (1.0 / 6.0),
+                p + (q - p) * 6.0 * t,
+                torch.where(
+                    t < 0.5,
+                    q,
+                    torch.where(
+                        t < (2.0 / 3.0),
+                        p + (q - p) * (2.0 / 3.0 - t) * 6.0,
+                        p,
+                    ),
+                ),
+            )
+
+        q = torch.where(l < 0.5, l * (1.0 + s), l + s - l * s)
+        p = 2.0 * l - q
+        r = hue_to_rgb(p, q, h + 1.0 / 3.0)
+        g = hue_to_rgb(p, q, h)
+        b = hue_to_rgb(p, q, h - 1.0 / 3.0)
+        rgb = torch.stack([r, g, b], dim=-1)
+        return torch.where(s[..., None] > eps, rgb, l[..., None])
+
+    def hue_to_rgb(p: np.ndarray, q: np.ndarray, t: np.ndarray) -> np.ndarray:
+        t = np.mod(t, 1.0)
+        return np.where(
+            t < (1.0 / 6.0),
+            p + (q - p) * 6.0 * t,
+            np.where(
+                t < 0.5,
+                q,
+                np.where(
+                    t < (2.0 / 3.0),
+                    p + (q - p) * (2.0 / 3.0 - t) * 6.0,
+                    p,
+                ),
+            ),
+        )
+
+    q = np.where(l < 0.5, l * (1.0 + s), l + s - l * s)
+    p = 2.0 * l - q
+    r = hue_to_rgb(p, q, h + 1.0 / 3.0)
+    g = hue_to_rgb(p, q, h)
+    b = hue_to_rgb(p, q, h - 1.0 / 3.0)
+    rgb = np.stack([r, g, b], axis=-1)
+    return np.where(s[..., None] > eps, rgb, l[..., None])
+
+
+def _hue_weight(h: ImageArray, center: float, width: float = HSL_WEIGHT_WIDTH) -> ImageArray:
+    dist = _where(h > center, h - center, center - h)
+    dist = _where(dist > 0.5, 1.0 - dist, dist)
+    return _clip(1.0 - _smoothstep(dist, 0.0, width), 0.0, 1.0)
+
+
+def _adjust_saturation(s: ImageArray, amount: float, weight: Optional[ImageArray] = None) -> ImageArray:
+    if abs(float(amount)) < 1e-6:
+        return s
+    if weight is None:
+        weight = 1.0
+    pos = max(float(amount), 0.0)
+    neg = min(float(amount), 0.0)
+    s = s + pos * weight * (1.0 - s)
+    s = s + neg * weight * s
+    return _clip(s, 0.0, 1.0)
+
+
+def _color_from_hsl(h: float, s: float, l: float, like: ImageArray) -> ImageArray:
+    h = float(h) % 1.0
+    s = float(np.clip(s, 0.0, 1.0))
+    l = float(np.clip(l, 0.0, 1.0))
+    if s <= 1e-6:
+        rgb = np.array([l, l, l], dtype=np.float32)
+    else:
+        q = l * (1.0 + s) if l < 0.5 else (l + s - l * s)
+        p = 2.0 * l - q
+        def hue_to_rgb(p_val: float, q_val: float, t_val: float) -> float:
+            t_val = t_val % 1.0
+            if t_val < 1.0 / 6.0:
+                return p_val + (q_val - p_val) * 6.0 * t_val
+            if t_val < 0.5:
+                return q_val
+            if t_val < 2.0 / 3.0:
+                return p_val + (q_val - p_val) * (2.0 / 3.0 - t_val) * 6.0
+            return p_val
+        r = hue_to_rgb(p, q, h + 1.0 / 3.0)
+        g = hue_to_rgb(p, q, h)
+        b = hue_to_rgb(p, q, h - 1.0 / 3.0)
+        rgb = np.array([r, g, b], dtype=np.float32)
+    if _is_torch(like):
+        return torch.tensor(rgb, device=like.device, dtype=like.dtype)
+    return rgb
+
+
+def _apply_presence(
+    rgb_lin: ImageArray,
+    texture: float,
+    clarity: float,
+    dehaze: float,
+) -> ImageArray:
+    if abs(float(texture)) > 1e-6:
+        rgb_lin = _apply_local_contrast(rgb_lin, texture * 0.4, radius=1)
+    if abs(float(clarity)) > 1e-6:
+        luma = _compute_luma(rgb_lin)
+        mid_w = _smoothstep(luma, 0.1, 0.4) * (1.0 - _smoothstep(luma, 0.6, 0.9))
+        rgb_lin = _apply_local_contrast(rgb_lin, clarity * 0.6, radius=3, mask=mid_w)
+    if abs(float(dehaze)) > 1e-6:
+        rgb_lin = _apply_local_contrast(rgb_lin, dehaze * 0.6, radius=8)
+        luma = _compute_luma(rgb_lin)
+        luma_adj = _apply_contrast(luma, dehaze * 0.35)
+        scale = luma_adj / (luma + 1e-6)
+        rgb_lin = _clip(rgb_lin * scale[..., None], 0.0, 1.0)
+    return rgb_lin
+
+
+def _apply_color_mixer(
+    rgb_lin: ImageArray,
+    vibrance: float,
+    saturation: float,
+    hsl_values: Dict[str, float],
+) -> ImageArray:
+    if (
+        abs(float(vibrance)) < 1e-6
+        and abs(float(saturation)) < 1e-6
+        and all(abs(float(v)) < 1e-6 for v in hsl_values.values())
+    ):
+        return rgb_lin
+
+    h, s, l = _rgb_to_hsl(rgb_lin)
+    h_base = h
+
+    if abs(float(vibrance)) > 1e-6:
+        skin_weight = _hue_weight(h_base, 30.0 / 360.0, width=0.07)
+        s = _clip(s + (1.0 - s) * vibrance * (1.0 - 0.5 * skin_weight), 0.0, 1.0)
+
+    if abs(float(saturation)) > 1e-6:
+        s = _adjust_saturation(s, saturation)
+
+    h_shift = 0.0
+    for color, center in HSL_COLOR_CENTERS.items():
+        weight = _hue_weight(h_base, center)
+        hue_delta = hsl_values[f"HueAdjustment{color}"] / 100.0
+        sat_delta = hsl_values[f"SaturationAdjustment{color}"] / 100.0
+        lum_delta = hsl_values[f"LuminanceAdjustment{color}"] / 100.0
+        if abs(float(hue_delta)) > 1e-6:
+            h_shift = h_shift + weight * hue_delta * (HUE_ADJ_MAX_DEG / 360.0)
+        if abs(float(sat_delta)) > 1e-6:
+            s = _adjust_saturation(s, sat_delta, weight)
+        if abs(float(lum_delta)) > 1e-6:
+            l = _apply_region(l, lum_delta, weight)
+
+    h = (h + h_shift) % 1.0
+    return _hsl_to_rgb(h, s, l)
+
+
+def _color_grade_weights(luma: ImageArray, blend: float) -> tuple[ImageArray, ImageArray, ImageArray]:
+    blend = float(np.clip(blend, 0.0, 1.0))
+    shadow_end = 0.35 + 0.1 * blend
+    highlight_start = 0.65 - 0.1 * blend
+    shadow_w = 1.0 - _smoothstep(luma, 0.0, shadow_end)
+    highlight_w = _smoothstep(luma, highlight_start, 1.0)
+    mid_w = _clip(1.0 - shadow_w - highlight_w, 0.0, 1.0)
+    return shadow_w, mid_w, highlight_w
+
+
+def _apply_color_grade(
+    rgb_lin: ImageArray,
+    luma: ImageArray,
+    hue_deg: float,
+    sat: float,
+    lum: float,
+    weight: ImageArray,
+) -> tuple[ImageArray, ImageArray]:
+    if not hasattr(weight, "shape"):
+        if _is_torch(luma):
+            weight = torch.full_like(luma, float(weight))
+        else:
+            weight = np.full_like(luma, float(weight), dtype=np.float32)
+    if abs(float(lum)) > 1e-6:
+        luma_adj = _apply_region(luma, lum, weight)
+        scale = luma_adj / (luma + 1e-6)
+        rgb_lin = _clip(rgb_lin * scale[..., None], 0.0, 1.0)
+        luma = luma_adj
+
+    if abs(float(sat)) > 1e-6:
+        sat_strength = min(abs(float(sat)), 1.0) * 0.6
+        if sat > 0:
+            color = _color_from_hsl(hue_deg / 360.0, abs(float(sat)), 0.5, rgb_lin)
+            rgb_lin = rgb_lin + weight[..., None] * sat_strength * (color - rgb_lin)
+        else:
+            rgb_lin = rgb_lin + weight[..., None] * sat_strength * (luma[..., None] - rgb_lin)
+        rgb_lin = _clip(rgb_lin, 0.0, 1.0)
+
+    return rgb_lin, luma
+
+
+def _apply_color_grading(
+    rgb_lin: ImageArray,
+    sliders: Dict[str, float],
+) -> tuple[ImageArray, Dict[str, ImageArray]]:
+    shadow_h = float(sliders["ColorGradeShadowHue"])
+    shadow_s = float(sliders["ColorGradeShadowSat"]) / 100.0
+    shadow_l = float(sliders["ColorGradeShadowLum"]) / 100.0
+    mid_h = float(sliders["ColorGradeMidtoneHue"])
+    mid_s = float(sliders["ColorGradeMidtoneSat"]) / 100.0
+    mid_l = float(sliders["ColorGradeMidtoneLum"]) / 100.0
+    high_h = float(sliders["ColorGradeHighlightHue"])
+    high_s = float(sliders["ColorGradeHighlightSat"]) / 100.0
+    high_l = float(sliders["ColorGradeHighlightLum"]) / 100.0
+    glob_h = float(sliders["ColorGradeGlobalHue"])
+    glob_s = float(sliders["ColorGradeGlobalSat"]) / 100.0
+    glob_l = float(sliders["ColorGradeGlobalLum"]) / 100.0
+    blend = float(sliders["ColorGradeBlending"]) / 100.0
+
+    luma = _compute_luma(rgb_lin)
+    shadow_w, mid_w, high_w = _color_grade_weights(luma, blend)
+    rgb_lin, luma = _apply_color_grade(rgb_lin, luma, shadow_h, shadow_s, shadow_l, shadow_w)
+    rgb_lin, luma = _apply_color_grade(rgb_lin, luma, mid_h, mid_s, mid_l, mid_w)
+    rgb_lin, luma = _apply_color_grade(rgb_lin, luma, high_h, high_s, high_l, high_w)
+    rgb_lin, luma = _apply_color_grade(rgb_lin, luma, glob_h, glob_s, glob_l, 1.0)
+    maps = {
+        "color_grade_shadow_w": shadow_w,
+        "color_grade_mid_w": mid_w,
+        "color_grade_highlight_w": high_w,
+    }
+    return rgb_lin, maps
+
+
+def _apply_calibration(
+    rgb_lin: ImageArray,
+    sliders: Dict[str, float],
+) -> ImageArray:
+    shadow_tint = float(sliders["ShadowTint"]) / 100.0
+    red_h = float(sliders["RedHue"]) / 100.0
+    red_s = float(sliders["RedSaturation"]) / 100.0
+    green_h = float(sliders["GreenHue"]) / 100.0
+    green_s = float(sliders["GreenSaturation"]) / 100.0
+    blue_h = float(sliders["BlueHue"]) / 100.0
+    blue_s = float(sliders["BlueSaturation"]) / 100.0
+
+    if abs(shadow_tint) > 1e-6:
+        luma = _compute_luma(rgb_lin)
+        shadow_w = 1.0 - _smoothstep(luma, 0.12, 0.45)
+        g_scale = 1.0 + shadow_tint * 0.4
+        rb_scale = 1.0 - shadow_tint * 0.2
+        if _is_torch(rgb_lin):
+            wb = torch.tensor([rb_scale, g_scale, rb_scale], device=rgb_lin.device, dtype=rgb_lin.dtype)
+        else:
+            wb = np.array([rb_scale, g_scale, rb_scale], dtype=np.float32)
+        rgb_lin = _clip(rgb_lin * (1.0 + shadow_w[..., None] * (wb - 1.0)), 0.0, 1.0)
+
+    if (
+        abs(red_h) < 1e-6 and abs(red_s) < 1e-6 and
+        abs(green_h) < 1e-6 and abs(green_s) < 1e-6 and
+        abs(blue_h) < 1e-6 and abs(blue_s) < 1e-6
+    ):
+        return rgb_lin
+
+    h, s, l = _rgb_to_hsl(rgb_lin)
+    rgb_base = rgb_lin
+    if _is_torch(rgb_base):
+        sum_rgb = rgb_base[..., 0] + rgb_base[..., 1] + rgb_base[..., 2]
+        weight_r = (rgb_base[..., 0] / (sum_rgb + 1e-6)) * s
+        weight_g = (rgb_base[..., 1] / (sum_rgb + 1e-6)) * s
+        weight_b = (rgb_base[..., 2] / (sum_rgb + 1e-6)) * s
+    else:
+        sum_rgb = rgb_base[..., 0] + rgb_base[..., 1] + rgb_base[..., 2]
+        weight_r = (rgb_base[..., 0] / (sum_rgb + 1e-6)) * s
+        weight_g = (rgb_base[..., 1] / (sum_rgb + 1e-6)) * s
+        weight_b = (rgb_base[..., 2] / (sum_rgb + 1e-6)) * s
+
+    hue_scale = CALIBRATION_HUE_MAX_DEG / 360.0
+    h = (h + weight_r * red_h * hue_scale) % 1.0
+    h = (h + weight_g * green_h * hue_scale) % 1.0
+    h = (h + weight_b * blue_h * hue_scale) % 1.0
+
+    s = _adjust_saturation(s, red_s, weight_r)
+    s = _adjust_saturation(s, green_s, weight_g)
+    s = _adjust_saturation(s, blue_s, weight_b)
+
+    return _hsl_to_rgb(h, s, l)
+
+
 def _apply_exposure(rgb_lin: ImageArray, exposure_stops: float) -> ImageArray:
     if _is_torch(rgb_lin):
         if not torch.is_tensor(exposure_stops):
@@ -136,15 +634,6 @@ def _apply_region(luma: ImageArray, amount: float, weight: ImageArray) -> ImageA
     return luma + pos * weight * (1.0 - luma) + neg * weight * luma
 
 
-def _get_slider(sliders: Dict[str, float], name: str, like: ImageArray) -> ImageArray:
-    val = sliders.get(name, SLIDER_DEFAULTS[name])
-    if _is_torch(like):
-        if torch.is_tensor(val):
-            return val.to(device=like.device, dtype=like.dtype)
-        return torch.tensor(float(val), device=like.device, dtype=like.dtype)
-    return float(val)
-
-
 def render_proxy(
     image: ImageArray,
     sliders: Dict[str, float],
@@ -153,7 +642,7 @@ def render_proxy(
     return_maps: bool = False,
 ) -> ImageArray | ProxyRenderResult:
     """
-    Render a proxy image using a subset of Lightroom-style tone sliders.
+    Render a proxy image using Lightroom-style tone and color sliders.
 
     Args:
         image: HxWx3 RGB image, uint8 or float in [0, 1]
@@ -172,12 +661,29 @@ def render_proxy(
         raise ValueError(f"Unsupported input_space: {input_space}")
 
     s = {**SLIDER_DEFAULTS, **(sliders or {})}
-    exposure = _get_slider(s, "Exposure2012", rgb_lin)
-    contrast = _get_slider(s, "Contrast2012", rgb_lin) / 100.0
-    highlights = _get_slider(s, "Highlights2012", rgb_lin) / 100.0
-    shadows = _get_slider(s, "Shadows2012", rgb_lin) / 100.0
-    whites = _get_slider(s, "Whites2012", rgb_lin) / 100.0
-    blacks = _get_slider(s, "Blacks2012", rgb_lin) / 100.0
+    exposure = float(s["Exposure2012"])
+    contrast = float(s["Contrast2012"]) / 100.0
+    highlights = float(s["Highlights2012"]) / 100.0
+    shadows = float(s["Shadows2012"]) / 100.0
+    whites = float(s["Whites2012"]) / 100.0
+    blacks = float(s["Blacks2012"]) / 100.0
+    texture = float(s["Texture"]) / 100.0
+    clarity = float(s["Clarity2012"]) / 100.0
+    dehaze = float(s["Dehaze"]) / 100.0
+    vibrance = float(s["Vibrance"]) / 100.0
+    saturation = float(s["Saturation"]) / 100.0
+
+    temp_delta = float(s["IncrementalTemperature"])
+    tint_delta = float(s["IncrementalTint"])
+    if sliders:
+        if sliders.get("Temperature") is not None:
+            temp_delta = float(sliders["Temperature"]) - 6500.0
+        if sliders.get("Tint") is not None:
+            tint_delta = float(sliders["Tint"])
+
+    # White balance in linear space (approximate, incremental by default).
+    rgb_lin = _apply_white_balance(rgb_lin, temp_delta, tint_delta)
+    rgb_lin = _clip(rgb_lin, 0.0, 1.0)
 
     # Exposure in linear space
     rgb_lin = _apply_exposure(rgb_lin, exposure)
@@ -206,10 +712,45 @@ def render_proxy(
     rgb_lin = rgb_lin * scale[..., None]
     rgb_lin = _clip(rgb_lin, 0.0, 1.0)
 
+    # Presence adjustments
+    rgb_lin = _apply_presence(rgb_lin, texture, clarity, dehaze)
+
+    # Color adjustments in a gamma-encoded space for closer perceptual behavior.
+    rgb_color = _clip(_linear_to_srgb(rgb_lin), 0.0, 1.0)
+
+    hsl_values = {
+        f"HueAdjustment{color}": float(s[f"HueAdjustment{color}"])
+        for color in HSL_COLOR_CENTERS
+    }
+    hsl_values.update({
+        f"SaturationAdjustment{color}": float(s[f"SaturationAdjustment{color}"])
+        for color in HSL_COLOR_CENTERS
+    })
+    hsl_values.update({
+        f"LuminanceAdjustment{color}": float(s[f"LuminanceAdjustment{color}"])
+        for color in HSL_COLOR_CENTERS
+    })
+    rgb_color = _apply_color_mixer(rgb_color, vibrance, saturation, hsl_values)
+
+    color_grade_maps = {}
+    if any(
+        abs(float(s[key])) > 1e-6
+        for key in (
+            "ColorGradeGlobalSat", "ColorGradeGlobalLum",
+            "ColorGradeShadowSat", "ColorGradeShadowLum",
+            "ColorGradeMidtoneSat", "ColorGradeMidtoneLum",
+            "ColorGradeHighlightSat", "ColorGradeHighlightLum",
+        )
+    ):
+        rgb_color, color_grade_maps = _apply_color_grading(rgb_color, s)
+
+    rgb_color = _apply_calibration(rgb_color, s)
+    rgb_color = _clip(rgb_color, 0.0, 1.0)
+
     if output_space == "srgb":
-        out = _linear_to_srgb(rgb_lin)
+        out = rgb_color
     elif output_space == "linear":
-        out = rgb_lin
+        out = _srgb_to_linear(rgb_color)
     else:
         raise ValueError(f"Unsupported output_space: {output_space}")
 
@@ -224,6 +765,7 @@ def render_proxy(
         "black_w": black_w,
         "white_w": white_w,
     }
+    maps.update(color_grade_maps)
     return ProxyRenderResult(image=out, luma_pre=luma_pre, luma_post=luma, maps=maps)
 
 

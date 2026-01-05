@@ -570,13 +570,13 @@ if __name__ == "__main__":
     # ]
     
     # Option 3: Folder path (will process all RAW files in folder)
-    IMAGE_INPUT = "/Users/eriksreinfelds/Pictures/2025/2025-12-08/"
+    IMAGE_INPUT = "/Users/eriksreinfelds/Pictures/2025/2025-12-10/"
     
     # Camera model (optional, set to None if not needed)
     CAMERA_MODEL = "ILCE-6700" # e.g., "ILCE-6700", "X-H2S", "Canon EOS 600D"
     
     # Model weights - Option A: Single model
-    MODEL_PATH = "model_weights/lightroom_model.pt"
+    MODEL_PATH = "model_weights/lightroom_model_learned_precision.pt"
     MODEL_PATHS = None  # Set to None for single model
     
     # Model weights - Option B: Ensemble (uncomment to use)

@@ -1,5 +1,16 @@
-env/
-.env/
-venv/
+# Environment files
+.env
+*.env
+**/.env
+
+# Virtual environments
 .venv/
+**/.venv/
+venv/
+**/venv/
+env/
+**/env/
+
+# Lightroom catalogue folder
 lightroom catalogue/
+lightroom catalogue/**/*

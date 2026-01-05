@@ -1,0 +1,21 @@
+# Lightroom Auto Editor Dependencies
+
+# Core ML
+torch>=2.1.0
+numpy>=1.24.0
+pandas>=2.0.0
+pyarrow>=14.0.0  # For parquet support
+
+# Image processing (for feature extraction)
+pillow>=10.0.0
+rawpy>=0.18.0
+
+# Optional: progress bars
+tqdm>=4.66.0
+
+
+
+
+
+
+
